@@ -25,10 +25,12 @@ async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
                 if '@sn' in device: # Filter out inactive devices by only returning entries that have a serial number
                     device_type = device["@type"]
                     device_serials[str(device['@id'])] = device['@sn']
+                    device_name = device["@type"] + "-" + device["@id"] # Since devices don't have friendly names, generate one automatically
                     if re.match(r"BT", device_type): # Thermostats return temp, humidity, and device status
                         devices.append(
                             {
                                 "i"              : device['@id'],
+                                "n"              : device_name,
                                 "type"           : device_type,
                                 "sn"             : device['@sn'],
                                 "characteristics": [ "ver", "t", "h", "bat", "sig", "alarm" ]
@@ -38,6 +40,7 @@ async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
                         devices.append(
                             {
                                 "i"              : device['@id'],
+                                "n"              : device_name,
                                 "type"           : device_type,
                                 "sn"             : device['@sn'],
                                 "characteristics": [ "ver", "t", "bat", "sig", "alarm" ]
@@ -47,6 +50,7 @@ async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
                         devices.append(
                             {
                                 "i"              : device['@id'],
+                                "n"              : device_name,
                                 "type"           : device_type,
                                 "sn"             : device['@sn'],
                                 "characteristics": [ "ver", "bat", "sig", "alarm" ]
