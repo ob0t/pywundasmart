@@ -1,1 +1,1 @@
-from .functions import get_devices, get_states, put_state
+from .functions import get_devices, put_state

@@ -2,12 +2,14 @@ import asyncio
 import aiohttp
 import xmltodict
 import re
+import copy
 
+DEVICE_DEFS = ['device_sn', 'prod_sn', 'device_name', 'device_type', 'eth_mac', 't', 'name', 'id', 'type', 'i']
 
 async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
     """ Returns a list of active devices connected to the Wundasmart controller """
 
-    devices = []
+    devices = {}
 
     """ Query the getdevices API, which returns a list of all devices connected to the controller. Data is formatted in XML """
     wunda_url = f"http://{wunda_ip}/getdevices.cgi" 
@@ -18,48 +20,42 @@ async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
         status = resp.status
 
         if status == 200:
-            device_serials = {}
-            data = await resp.text()
-            xml_data = xmltodict.parse(data)
-            for device in xml_data["devices"]["dev"]:
-                if '@sn' in device: # Filter out inactive devices by only returning entries that have a serial number
-                    device_type = device["@type"]
-                    device_serials[str(device['@id'])] = device['@sn']
-                    device_name = device["@type"] + "-" + device["@id"] # Since devices don't have friendly names, generate one automatically
-                    if re.match(r"BT", device_type): # Thermostats return temp, humidity, and device status
-                        devices.append(
-                            {
-                                "i"              : device['@id'],
-                                "n"              : device_name,
-                                "type"           : device_type,
-                                "sn"             : device['@sn'],
-                                "characteristics": [ "ver", "t", "h", "bat", "sig", "alarm" ]
-                            }
-                        )
-                    elif re.match(r"TH", device_type): # TRVs return temp and device status
-                        devices.append(
-                            {
-                                "i"              : device['@id'],
-                                "n"              : device_name,
-                                "type"           : device_type,
-                                "sn"             : device['@sn'],
-                                "characteristics": [ "ver", "t", "bat", "sig", "alarm" ]
-                            }
-                        )
-                    elif re.match(r"HB", device_type): # UFH controllers only return device status  
-                        devices.append(
-                            {
-                                "i"              : device['@id'],
-                                "n"              : device_name,
-                                "type"           : device_type,
-                                "sn"             : device['@sn'],
-                                "characteristics": [ "ver", "bat", "sig", "alarm" ]
-                            }
-                        )
+            xml_data = await resp.text()
+            xml_dict = xmltodict.parse(xml_data, attr_prefix='')["devices"]["dev"]
+            for device in xml_dict:
+                device_id = device["id"]
+                devices[device_id] = { 
+                                            "type" : device["type"],
+                                            "id"   : f'{device["type"]}.{device["id"]}'
+                                        }
+                if "sn" in device: devices[device_id]["sn"] = device["sn"]
         else:
             return {"state": False, "code": status}
     except (asyncio.TimeoutError, aiohttp.ClientError):
-        return {"state": False, "code": 500}
+        return {"state": False, "code": 500, "message": "HTTP client error"}
+
+    """ Query the syncvalues API, which returns a list of all sensor values for all devices. Data is formatted as semicolon-separated k;v pairs """
+    wunda_url = f"http://{wunda_ip}/syncvalues.cgi?v=2"
+    try:
+        resp = await httpsession.get(
+            wunda_url, auth=aiohttp.BasicAuth(wunda_user, wunda_pass)
+        )
+        status = resp.status
+        if status == 200:
+            data = await resp.text()
+            for device_state in data.splitlines():
+                device_state_split = dict(x.split(":") for x in device_state.split(";") if ":" in x)
+                device_id = str(device_state.split(";")[0])
+                devices[device_id]["state"] = {}
+                for device_state_key in device_state_split:
+                    if device_state_key in DEVICE_DEFS:
+                        devices[device_id][device_state_key] = device_state_split[device_state_key]
+                    else:
+                        devices[device_id]["state"][device_state_key] = device_state_split[device_state_key]
+        else:
+            return {"state": False, "code": status}
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return {"state": False, "code": 500, "message": "HTTP client error"}
 
     """ Query the cmd API, which returns a list of rooms configured on the controller. Data is formatted in JSON """
     wunda_url = f"http://{wunda_ip}/cmd.cgi"
@@ -72,159 +68,48 @@ async def get_devices(httpsession, wunda_ip, wunda_user, wunda_pass):
         if status == 200:
             data = await resp.json()
             for room in data["rooms"]:
-                devices.append(
-                    {
-                        "i"              : room["i"],
-                        "type"           : "ROOM",
-                        "sn"             : room["n"], # since rooms don't have a serial number, we use the room name instead
-                        "n"              : room["n"].replace("%20", " "),
-                        "characteristics": ["t", "h", "sp", "tp"]
-                    }
-                )
+                for room_key in room:
+                    room_id = str(room["i"])
+                    if room_key == "t": devices[room_id]["state"]["room_temp"] = room[room_key]
+                    if room_key in DEVICE_DEFS:
+                        devices[room_id][room_key] = room[room_key]
+                    else:
+                        devices[room_id]["state"][room_key] = room[room_key]
         else:
             return {"state": False, "code": status}
     except (asyncio.TimeoutError, aiohttp.ClientError):
         return {"state": False, "code": 500}
 
+    #devices_list = []
+
+    #for device in devices:
+    #    devices_list.append(devices[device])
+
     return {"state": True, "devices": devices}
 
-
-async def get_states(httpsession, wunda_ip, wunda_user, wunda_pass):
-    """ Returns a full list of metrics from the Wundasmart controller """
-
-    states = []
-
-    """ Since only the getdevices API provides serial numbers, first we need to query that """
-    wunda_url = f"http://{wunda_ip}/getdevices.cgi"
+async def put_state(httpsession, wunda_ip, wunda_user, wunda_pass, wunda_id, wunda_key, wunda_val):
+    response = {}
+    wunda_url = f"http://{wunda_ip}/setregister.cgi"
     try:
-        resp = await httpsession.get(
-            wunda_url, auth=aiohttp.BasicAuth(wunda_user, wunda_pass)
-        )
-        status = resp.status
-
-        if status == 200:
-            device_serials = {}
-            data = await resp.text()
-            xml_data = xmltodict.parse(data)
-            for device in xml_data["devices"]["dev"]:
-                if '@sn' in device:
-                    device_serials[str(device['@id'])] = device['@sn']
-        else:
-            return []
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        return []
-
-    """ Query the cmd API to get climate data for each room """
-    wunda_url = f"http://{wunda_ip}/cmd.cgi"
-    try:
-        resp = await httpsession.get(
-            wunda_url, auth=aiohttp.BasicAuth(wunda_user, wunda_pass)
-        )
-        status = resp.status
-        if status == 200:
-            data = await resp.json()
-            for room_state in data["rooms"]:
-                states.append(
-                    {
-                        "i": room_state["i"],
-                        "sn": room_state["n"], # since rooms don't have a serial number, we use the room name instead
-                        "state": {
-                            "t": room_state["t"], # temperature
-                            "h": room_state["h"], # humidity
-                            "sp": room_state["sp"], # set point
-                            "tp": room_state["tp"] # temperature mode
-                        }
-                    }
-                )
-        else:
-            return []
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        return []
-
-    """ Query the syncvalues API to get sensor data from each device """
-    wunda_url = f"http://{wunda_ip}/syncvalues.cgi?v=2"
-    try:
-        resp = await httpsession.get(
-            wunda_url, auth=aiohttp.BasicAuth(wunda_user, wunda_pass)
-        )
-        status = resp.status
-        if status == 200:
-            data = await resp.text()
-            for device_state in data.splitlines():
-                device_state_split = dict(x.split(":") for x in device_state.split(";") if ":" in x)
-                if ('s', '1') in device_state_split.items():
-                        i = device_state.split(";")[0]
-                        if i in device_serials:  # only process devices where we know the serial
-                            device_type = device_state_split["t"]
-                            if re.match(r"^BT", device_type):
-                                states.append (
-                                    {
-                                        "i"     : device_state.split(";")[0],
-                                        "sn"    : device_serials[i],
-                                        "state" : {
-                                            "ver": device_state_split["v"],
-                                            "t": device_state_split["temp"],
-                                            "h": device_state_split["rh"],
-                                            "bat": device_state_split["bat"],
-                                            "sig": device_state_split["sig"],
-                                            "alarm": device_state_split["alarm"]
-                                        }
-                                    }
-                                )
-                            elif re.match(r"^TH", device_type):
-                                states.append (
-                                    {
-                                        "i"     : device_state.split(";")[0],
-                                        "sn"    : device_serials[i],
-                                        "state" : {
-                                            "ver": device_state_split["v"],
-                                            "t": device_state_split["vtemp"],
-                                            "bat": device_state_split["bat"],
-                                            "sig": device_state_split["sig"],
-                                            "alarm": device_state_split["alarm"]
-                                        }
-                                    }
-                                )
-                            elif re.match(r"^HB", device_type):
-                                states.append (
-                                    {
-                                        "i"     : device_state.split(";")[0],
-                                        "sn"    : device_serials[i],
-                                        "state" : {
-                                            "ver": device_state_split["v"],
-                                            "bat": device_state_split["bat"],
-                                            "sig": device_state_split["sig"],
-                                            "alarm": device_state_split["alarm"]
-                                        }
-                                    }
-                                )
-        else:
-            return []
-    except (asyncio.TimeoutError, aiohttp.ClientError):
-        return []
-
-    return states
-
-async def put_state(httpsession, wunda_ip, wunda_user, wunda_pass, deviceid, params):
-    wunda_url = f"http://{wunda_ip}/cmd.cgi"
-    try:
-        params.append(("i", id))
+        params = f"{wunda_id}@{wunda_key}={wunda_val}"
         resp = await httpsession.get(
             wunda_url, auth=aiohttp.BasicAuth(wunda_user, wunda_pass), params=params
         )
         status = resp.status
         if status == 200:
-            data = await resp.json()
-            for room in data["rooms"]:
-                if room["i"] == deviceid:
-                    state = {
-                        "t": room["t"],
-                        "h": room["h"],
-                        "sp": room["sp"],
-                        "tp": room["tp"],
-                    }
-                    return state
-        return {}
+            # the setregister.cgi API returns XML formatted response, e.g. <cmd status="ok"><device id="0"><reg vid="121" tid="temp_pre" v="1" status="ok"/></device></cmd>
+            xml_data = await resp.text()
+            xml_dict = xmltodict.parse(xml_data, attr_prefix='')
+            if xml_dict["cmd"]["status"] == "ok":
+                if xml_dict["cmd"]["device"]["reg"]["status"] == "ok":
+                    response[xml_dict["cmd"]["device"]["reg"]["tid"]] = xml_dict["cmd"]["device"]["reg"]["v"]
+                else:
+                    return {"state": False, "code": 500, "message": xml_dict["cmd"]["device"]["reg"]["status"]}
+            else:
+                return {"state": False, "code": 500, "message": xml_dict["cmd"]["status"]}
+        else:
+            return {"state": False, "code": status}
     except (asyncio.TimeoutError, aiohttp.ClientError):
-        return {}
+        return {"state": False, "code": 500, "message": "HTTP client error"}
 
+    return {"state": True, "response": response}
